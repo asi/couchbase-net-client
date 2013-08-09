@@ -10,6 +10,8 @@ using System.Diagnostics;
 using Enyim.Caching.Memcached.Results;
 using Enyim.Caching.Memcached.Results.Factories;
 using Enyim.Caching.Memcached.Results.Extensions;
+using System.Collections.Concurrent;
+using System.Threading.Tasks;
 
 namespace Enyim.Caching
 {
@@ -813,93 +815,66 @@ namespace Enyim.Caching
 			});
 		}
 
-		protected virtual IDictionary<string, T> PerformMultiGet<T>(IEnumerable<string> keys, Func<IMultiGetOperation, KeyValuePair<string, CacheItem>, T> collector)
-		{
-			// transform the keys and index them by hashed => original
-			// the mget results will be mapped using this index
-			var hashed = new Dictionary<string, string>();
-			foreach (var key in keys) hashed[this.keyTransformer.Transform(key)] = key;
+        protected virtual IDictionary<string, T> PerformMultiGet<T>(IEnumerable<string> keys, Func<IMultiGetOperation, KeyValuePair<string, CacheItem>, T> collector)
+        {
+            // transform the keys and index them by hashed => original
+            // the mget results will be mapped using this index
+            var hashed = new Dictionary<string, string>();
+            foreach (var key in keys) hashed[this.keyTransformer.Transform(key)] = key;
 
-			var byServer = GroupByServer(hashed.Keys);
+            var byServer = GroupByServer(hashed.Keys);
 
-			var retval = new Dictionary<string, T>(hashed.Count);
-			var handles = new List<WaitHandle>();
+            var retval = new ConcurrentDictionary<string, T>();
+            
+            Parallel.ForEach(byServer, slice =>
+            {
+                var node = slice.Key;
+                var nodeKeys = slice.Value;
+                var mget = this.pool.OperationFactory.MultiGet(nodeKeys);
+                try
+                {
+                    var result = node.Execute(mget);
+                    if (result.Success)
+                    {
+                        #region perfmon
+                        if (this.performanceMonitor != null)
+                        {
+                            // full list of keys sent to the server
+                            var expectedKeys = nodeKeys;
+                            var expectedCount = expectedKeys.Count;
 
-			//execute each list of keys on their respective node
-			foreach (var slice in byServer)
-			{
-				var node = slice.Key;
+                            // number of items returned
+                            var resultCount = mget.Result.Count;
 
-				var nodeKeys = slice.Value;
-				var mget = this.pool.OperationFactory.MultiGet(nodeKeys);
+                            // log the results
+                            this.performanceMonitor.Get(resultCount, true);
 
-				// we'll use the delegate's BeginInvoke/EndInvoke to run the gets parallel
-				var action = new Func<IOperation, IOperationResult>(node.Execute);
-				var mre = new ManualResetEvent(false);
-				handles.Add(mre);
+                            // log the missing keys
+                            if (resultCount != expectedCount)
+                                this.performanceMonitor.Get(expectedCount - resultCount, true);
+                        }
+                        #endregion
 
-				//execute the mgets in parallel
-				action.BeginInvoke(mget, iar =>
-				{
-					try
-					{
-						using (iar.AsyncWaitHandle)
-							if (action.EndInvoke(iar).Success)
-							{
-								#region perfmon
-								if (this.performanceMonitor != null)
-								{
-									// full list of keys sent to the server
-									var expectedKeys = (string[])iar.AsyncState;
-									var expectedCount = expectedKeys.Length;
+                        // deserialize the items in the dictionary
+                        foreach (var kvp in mget.Result)
+                        {
+                            string original;
+                            if (hashed.TryGetValue(kvp.Key, out original))
+                            {
+                                var item = collector(mget, kvp);
+                                retval.TryAdd(original, item);
+                            }
+                        }
+                    }
+                }
+                catch (Exception e)
+                {
+                    log.Error(e);
+                }
+            });
 
-									// number of items returned
-									var resultCount = mget.Result.Count;
-
-									// log the results
-									this.performanceMonitor.Get(resultCount, true);
-
-									// log the missing keys
-									if (resultCount != expectedCount)
-										this.performanceMonitor.Get(expectedCount - resultCount, true);
-								}
-								#endregion
-
-								// deserialize the items in the dictionary
-								foreach (var kvp in mget.Result)
-								{
-									string original;
-									if (hashed.TryGetValue(kvp.Key, out original))
-									{
-										var result = collector(mget, kvp);
-
-										// the lock will serialize the merge,
-										// but at least the commands were not waiting on each other
-										lock (retval) retval[original] = result;
-									}
-								}
-							}
-					}
-					catch (Exception e)
-					{
-						log.Error(e);
-					}
-					finally
-					{
-						// indicate that we finished processing
-						mre.Set();
-					}
-				}, nodeKeys);
-			}
-
-			// wait for all nodes to finish
-			if (handles.Count > 0)
-			{
-				SafeWaitAllAndDispose(handles.ToArray());
-			}
-
-			return retval;
-		}
+            return retval;
+        }
 
 		protected Dictionary<IMemcachedNode, IList<string>> GroupByServer(IEnumerable<string> keys)
 		{
