@@ -245,17 +245,7 @@ namespace Enyim.Caching.Memcached
 			this.CheckDisposed();
 
 			SocketError status;
-
-#if DEBUG
-			int total = 0;
-			for (int i = 0, C = buffers.Count; i < C; i++)
-				total += buffers[i].Count;
-
-			if (this.socket.Send(buffers, SocketFlags.None, out status) != total)
-				System.Diagnostics.Debugger.Break();
-#else
 			this.socket.Send(buffers, SocketFlags.None, out status);
-#endif
 
 			if (status != SocketError.Success)
 			{
